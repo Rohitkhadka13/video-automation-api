@@ -1,0 +1,113 @@
+# =============================================================================
+# AI Video SaaS — backend/Dockerfile.worker
+# Celery worker image. Extends the API runtime stage with:
+#   - faster-whisper (heavier ML deps, needs extra build tooling)
+#   - No exposed port (workers pull from Redis, never accept inbound connections)
+# Uses the same builder stage as Dockerfile for venv caching.
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Stage 1 — builder (identical base as API Dockerfile for cache reuse)
+# -----------------------------------------------------------------------------
+FROM python:3.12-slim AS builder
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    VENV_PATH=/opt/venv
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    libpq-dev \
+    gcc \
+    g++ \
+    curl \
+    cmake \
+    libsndfile1-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN python -m venv $VENV_PATH
+ENV PATH="$VENV_PATH/bin:$PATH"
+
+WORKDIR /build
+COPY requirements.txt .
+RUN pip install --upgrade pip setuptools wheel && \
+    pip install -r requirements.txt && \
+    # faster-whisper requires ctranslate2 which needs a separate install step
+    pip install faster-whisper==1.0.3
+
+# -----------------------------------------------------------------------------
+# Stage 2 — worker runtime
+# -----------------------------------------------------------------------------
+FROM python:3.12-slim AS runtime
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    VENV_PATH=/opt/venv \
+    APP_HOME=/app \
+    PATH="/opt/venv/bin:$PATH" \
+    # Whisper model cache directory
+    HF_HOME=/app/models/whisper \
+    TRANSFORMERS_CACHE=/app/models/whisper
+
+# Runtime system libraries
+# ffmpeg:       video/audio processing
+# libsndfile1:  audio file I/O for whisper
+# piper deps:   shared libs for TTS binary
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libpq5 \
+    ffmpeg \
+    libsndfile1 \
+    curl \
+    wget \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Piper TTS binary (same as API image)
+ARG PIPER_VERSION=2023.11.14-2
+RUN ARCH=$(dpkg --print-architecture) && \
+    wget -q "https://github.com/rhasspy/piper/releases/download/${PIPER_VERSION}/piper_${ARCH}.tar.gz" \
+    -O /tmp/piper.tar.gz && \
+    tar -xzf /tmp/piper.tar.gz -C /usr/local/bin --strip-components=1 && \
+    rm /tmp/piper.tar.gz && \
+    piper --help > /dev/null 2>&1 || true
+
+# Non-root user
+RUN groupadd --gid 1001 appgroup && \
+    useradd --uid 1001 --gid appgroup --shell /bin/bash --create-home appuser
+
+# Copy venv from builder
+COPY --from=builder $VENV_PATH $VENV_PATH
+
+WORKDIR $APP_HOME
+
+RUN mkdir -p \
+    $APP_HOME/media/uploads \
+    $APP_HOME/media/processed \
+    $APP_HOME/media/thumbnails \
+    $APP_HOME/media/audio \
+    $APP_HOME/logs \
+    $APP_HOME/models/piper \
+    $APP_HOME/models/whisper \
+    && chown -R appuser:appgroup $APP_HOME
+
+COPY --chown=appuser:appgroup . $APP_HOME
+
+USER appuser
+
+# Worker health check via Celery's built-in inspect ping
+HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
+    CMD celery -A app.infrastructure.celery.celery_app:celery_app inspect ping \
+        -d "worker@$HOSTNAME" --timeout 5 || exit 1
+
+# Default: start worker consuming all queues.
+# Override in docker-compose per service (worker vs beat vs flower).
+CMD ["celery", \
+     "-A", "app.infrastructure.celery.celery_app:celery_app", \
+     "worker", \
+     "--loglevel=info", \
+     "--concurrency=4", \
+     "--queues=default,video,transcription,tts", \
+     "--hostname=worker@%h", \
+     "--max-tasks-per-child=100"]
